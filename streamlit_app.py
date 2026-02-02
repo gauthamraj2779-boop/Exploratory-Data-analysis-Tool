@@ -3,12 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import hashlib
+import pickle
 import preprocessing_pipeline as pipeline
+import preprocessing.text_vectorization as text_vectorization
 from EDA import (
     display_dataset_overview, display_missing_values, display_data_types,
     display_statistics_visualization, search_column, display_individual_feature_distribution,
     display_scatter_plot_of_two_numeric_features, categorical_variable_analysis,
-    feature_exploration_numerical_variables, categorical_numerical_variable_analysis
+    feature_exploration_numerical_variables, categorical_numerical_variable_analysis, safe_duplicate_count
 )
 
 st.set_page_config(page_title="Advanced Automated EDA & Preprocessing", layout="wide")
@@ -172,6 +174,38 @@ def show_advanced_preprocessing(df):
                         st.session_state.processed_df = df
                         st.session_state.changed_columns = [selected_col]
                         st.rerun()
+
+        # Text Vectorization (BoW & TF-IDF)
+        with st.sidebar.expander("🔠 Text Vectorization (BoW & TF-IDF)"):
+            st.caption("Convert text into numerical features using statistical methods.")
+            
+            vec_col = st.selectbox("Select text column", text_cols, key="vec_col_select")
+            
+            # Options
+            vec_method = st.radio("Method", ["Bag of Words (Count)", "TF-IDF (Weighted)"], key="vec_method")
+            max_feats = st.slider("Max Features (Top Words)", 5, 500, 50, key="vec_max_feats")
+            
+            if "Bag" in vec_method:
+                method_code = 'bow'
+                st.info("ℹ️ Counts word frequencies. Good for simple keyword matching.")
+            else:
+                method_code = 'tfidf'
+                st.info("ℹ️ Weighs words by importance (low weight for common words).")
+
+            if st.button("Generate Vectors", key="gen_vec_btn"):
+                if validate_columns(df, [vec_col], "vectorize text"):
+                    with st.spinner("Generating vectors..."):
+                        # Call backend
+                        df_new, res = text_vectorization.generate_text_vectors(df, vec_col, method=method_code, max_features=max_feats)
+                        
+                        if isinstance(res, str): # Error message
+                             st.error(f"Error: {res}")
+                        else:
+                             save_to_history(df_new)
+                             st.session_state.processed_df = df_new
+                             st.session_state.changed_columns = res # New columns
+                             st.success(f"✅ Created single vector column: {res[0]}")
+                             st.rerun()
 
     # Advanced Imputation
     with st.sidebar.expander("🔧 Advanced Imputation"):
@@ -513,7 +547,10 @@ def main():
                 - **Gradient Boosting:** High-performance ensemble method (e.g., XGBoost style).
                 - **SVC:** Support Vector Classifier, effective in high dimensions.
                 - **KNN:** K-Nearest Neighbors, instance-based learning.
-                - **Linear/Ridge/Lasso:** Classic regression models.
+                - **AdaBoost:** Adaptive Boosting, focuses on hard-to-classify instances.
+                - **Gaussian NB:** Naive Bayes, good for text/high-dim data.
+                - **MLP (Neural Net):** Multi-layer Perceptron, powerful for complex patterns.
+                - **Linear/Ridge/Lasso/ElasticNet:** Regression models with regularization.
                 """)
 
                 st.write("### ⚙️ Configuration")
@@ -560,75 +597,148 @@ def main():
                         metrics_df = pd.DataFrame(data)
                         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
+                    # Feature Importance Section
+                    feature_importances = results.get("feature_importances", {})
+                    if feature_importances:
+                        st.markdown("---")
+                        st.write("### 🌟 Feature Importance")
+                        st.caption("Which features (columns) had the most impact on the prediction?")
+                        
+                        fi_models = list(feature_importances.keys())
+                        # Default to best model if it has importance info, else first available
+                        fi_default_idx = 0
+                        if best_model in fi_models:
+                            fi_default_idx = fi_models.index(best_model)
+                            
+                        fi_model_name = st.selectbox("Select Model to View Importance", fi_models, index=fi_default_idx, key="fi_model_select")
+                        
+                        if fi_model_name:
+                            fi_df = feature_importances[fi_model_name]
+                            
+                            # Display as chart and table side-by-side
+                            fi_c1, fi_c2 = st.columns([2, 1])
+                            
+                            with fi_c1:
+                                st.bar_chart(fi_df.set_index("Feature")["Importance"], color="#FF4B4B")
+                                
+                            with fi_c2:
+                                st.dataframe(fi_df, use_container_width=True, hide_index=True, height=300)
+
                     st.markdown("---")
                     st.write("### 🔮 Make Predictions")
                     
                     feature_names = results.get("feature_names", [])
                     models = results.get("models", {})
+                    excluded_cols = results.get("excluded_columns", [])
                     
                     if not feature_names:
                         st.warning("No features found.")
+                    elif not models:
+                        if excluded_cols:
+                            st.warning("No trained models available. Some columns were excluded from training because they contain sequence-like values (lists/tuples/arrays):")
+                            st.write(excluded_cols)
+                            st.info("Tip: Use Text Vectorization only for input features, not as the target. Sequence-like columns are automatically excluded to ensure training stability.")
+                        else:
+                            st.warning("No trained models available. Please train models first.")
                     else:
                         model_options = list(models.keys())
                         default_idx = model_options.index(best_model) if best_model in model_options else 0
+                        
                         selected_model_name = st.selectbox("Select Model for Prediction", model_options, index=default_idx, key="pred_model_select_main")
-                        selected_model = models[selected_model_name]
+                        
+                        if selected_model_name:
+                            selected_model = models[selected_model_name]
 
-                        pred_mode = st.radio("Prediction Mode", ["Manual Input", "Upload File"], key="pred_mode_radio_main", horizontal=True)
-                        
-                        input_data = None
-                        
-                        if pred_mode == "Manual Input":
-                            with st.form("prediction_form_main"):
-                                st.write("Enter values for features:")
-                                input_vals = {}
-                                input_cols = st.columns(3)
-                                for i, feature in enumerate(feature_names):
-                                    default_val = 0.0
-                                    if feature in current_df.columns and pd.api.types.is_numeric_dtype(current_df[feature]):
-                                         default_val = float(current_df[feature].mean())
+                            pred_mode = st.radio("Prediction Mode", ["Manual Input", "Upload File"], key="pred_mode_radio_main", horizontal=True)
+                            
+                            input_data = None
+                            
+                            if pred_mode == "Manual Input":
+                                with st.form("prediction_form_main"):
+                                    st.write("Enter values for features:")
+                                    input_vals = {}
+                                    input_cols = st.columns(3)
+                                    feature_types = results.get("feature_types", {})
+
+                                    for i, feature in enumerate(feature_names):
+                                        with input_cols[i % 3]:
+                                            is_numeric = False
+                                            if feature in current_df.columns:
+                                                is_numeric = pd.api.types.is_numeric_dtype(current_df[feature])
+                                            elif feature in feature_types:
+                                                dtype_str = str(feature_types[feature])
+                                                is_numeric = 'int' in dtype_str or 'float' in dtype_str
+                                            
+                                            if is_numeric:
+                                                default_val = 0.0
+                                                if feature in current_df.columns:
+                                                    default_val = float(current_df[feature].mean())
+                                                input_vals[feature] = st.number_input(f"{feature}", value=default_val, key=f"input_{feature}_main")
+                                            else:
+                                                # For categorical, try to get unique values for a selectbox
+                                                unique_vals = []
+                                                if feature in current_df.columns:
+                                                    unique_vals = current_df[feature].dropna().unique().tolist()
+                                                
+                                                if unique_vals and len(unique_vals) <= 50: 
+                                                    input_vals[feature] = st.selectbox(f"{feature}", unique_vals, key=f"input_{feature}_main")
+                                                else:
+                                                    input_vals[feature] = st.text_input(f"{feature}", key=f"input_{feature}_main")
                                     
-                                    with input_cols[i % 3]:
-                                        input_vals[feature] = st.number_input(f"{feature}", value=default_val, key=f"input_{feature}_main")
-                                
-                                if st.form_submit_button("Predict"):
-                                    input_data = pd.DataFrame([input_vals])
-                                
-                        else:
-                            pred_file = st.file_uploader("Upload CSV/Excel for Prediction", type=["csv", "xlsx", "xls"], key="pred_file_uploader_main")
-                            if pred_file:
-                                input_df = load_data(pred_file)
-                                if input_df is not None:
-                                    missing_cols = [col for col in feature_names if col not in input_df.columns]
-                                    if missing_cols:
-                                        st.error(f"Uploaded file is missing columns: {', '.join(missing_cols)}")
+                                    if st.form_submit_button("Predict"):
+                                        input_data = pd.DataFrame([input_vals])
+                                    
+                            else:
+                                pred_file = st.file_uploader("Upload CSV/Excel for Prediction", type=["csv", "xlsx", "xls"], key="pred_file_uploader_main")
+                                if pred_file:
+                                    input_df = load_data(pred_file)
+                                    if input_df is not None:
+                                        missing_cols = [col for col in feature_names if col not in input_df.columns]
+                                        if missing_cols:
+                                            st.error(f"Uploaded file is missing columns: {', '.join(missing_cols)}")
+                                        else:
+                                            input_data = input_df[feature_names]
+                                            if st.button("Run Prediction on File", key="predict_file_btn_main"):
+                                                pass 
+
+                            if input_data is not None:
+                                try:
+                                    predictions = selected_model.predict(input_data)
+                                    st.success("✅ Prediction Complete")
+                                    
+                                    if len(predictions) == 1:
+                                        st.metric(label="Predicted Result", value=str(predictions[0]))
                                     else:
-                                        input_data = input_df[feature_names]
-                                        if st.button("Run Prediction on File", key="predict_file_btn_main"):
-                                            pass 
-
-                        if input_data is not None:
-                            try:
-                                predictions = selected_model.predict(input_data)
-                                st.success("✅ Prediction Complete")
-                                
-                                if len(predictions) == 1:
-                                    st.metric(label="Predicted Result", value=str(predictions[0]))
-                                else:
-                                    res_df = input_data.copy()
-                                    res_df[f"Prediction"] = predictions
-                                    st.dataframe(res_df)
+                                        res_df = input_data.copy()
+                                        res_df[f"Prediction"] = predictions
+                                        st.dataframe(res_df)
+                                        
+                                        csv = res_df.to_csv(index=False).encode('utf-8')
+                                        st.download_button(
+                                            label="Download Predictions",
+                                            data=csv,
+                                            file_name="predictions.csv",
+                                            mime="text/csv",
+                                            key="download_pred_btn_main"
+                                        )
+                                except Exception as e:
+                                    st.error(f"Prediction Error: {e}")
                                     
-                                    csv = res_df.to_csv(index=False).encode('utf-8')
-                                    st.download_button(
-                                        label="Download Predictions",
-                                        data=csv,
-                                        file_name="predictions.csv",
-                                        mime="text/csv",
-                                        key="download_pred_btn_main"
-                                    )
+                        st.markdown("---")
+                        st.write("### 📥 Download Model")
+                        if selected_model_name:
+                             # Pickle the model
+                            try:
+                                model_pkl = pickle.dumps(models[selected_model_name])
+                                st.download_button(
+                                    label=f"Download {selected_model_name} (.pkl)",
+                                    data=model_pkl,
+                                    file_name=f"{selected_model_name.replace(' ', '_').lower()}_model.pkl",
+                                    mime="application/octet-stream",
+                                    key="download_model_btn_main"
+                                )
                             except Exception as e:
-                                st.error(f"Prediction Error: {e}")
+                                st.error(f"Error preparing download: {e}")
                 else:
                     st.info("👈 Configure and train models using the panel on the left to see results here.")
 
@@ -642,12 +752,12 @@ def main():
                     st.info("Original Data")
                     st.write(f"**Shape:** {orig_df.shape}")
                     st.write(f"**Missing Values:** {orig_df.isnull().sum().sum()}")
-                    st.write(f"**Duplicates:** {orig_df.duplicated().sum()}")
+                    st.write(f"**Duplicates:** {safe_duplicate_count(orig_df)}")
                 with c2:
                     st.success("Processed Data")
                     st.write(f"**Shape:** {current_df.shape}")
                     st.write(f"**Missing Values:** {current_df.isnull().sum().sum()}")
-                    st.write(f"**Duplicates:** {current_df.duplicated().sum()}")
+                    st.write(f"**Duplicates:** {safe_duplicate_count(current_df)}")
 
                 st.markdown("---")
                 st.write("### 📊 Distribution Comparison")

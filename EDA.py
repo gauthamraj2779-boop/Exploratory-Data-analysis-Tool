@@ -16,6 +16,20 @@ def safe_execute(func, *args, **kwargs):
     except Exception as e:
         return None, str(e)
 
+def safe_duplicate_count(df):
+    """Return duplicate row count, robust to unhashable cells (e.g., lists)"""
+    try:
+        return df.shape[0] - df.drop_duplicates().shape[0]
+    except TypeError:
+        df_conv = df.copy()
+        for c in df_conv.columns:
+            df_conv[c] = df_conv[c].apply(
+                lambda v: tuple(v) if isinstance(v, list) else (
+                    tuple(v.tolist()) if hasattr(v, 'tolist') and not isinstance(v, (str, bytes)) else v
+                )
+            )
+        return df_conv.shape[0] - df_conv.drop_duplicates().shape[0]
+
 def load_data(file):
     return pd.read_csv(file)
 
@@ -38,7 +52,7 @@ def display_dataset_overview(df, cat_columns, num_columns):
     st.subheader("2. Dataset Overview")
     st.write(f"**Rows:** {df.shape[0]}")
     st.write(f"**Columns:** {df.shape[1]}")
-    st.write(f"**Duplicates:** {df.shape[0] - df.drop_duplicates().shape[0]}")
+    st.write(f"**Duplicates:** {safe_duplicate_count(df)}")
     st.write(f"**Categorical Columns:** {len(cat_columns)}")
     st.write(cat_columns)
     st.write(f"**Numerical Columns:** {len(num_columns)}")
@@ -73,14 +87,21 @@ def display_statistics_visualization(df, cat_columns, num_columns):
 
         for column in selected_cat_columns:
             st.write(f"**{column}**")
-            value_counts = df[column].value_counts()
-            st.bar_chart(value_counts)
+            # Calculate value counts once
+            value_counts = df[column].value_counts().reset_index()
+            value_counts.columns = ['Category', 'Count'] # Use generic names to prevent Altair syntax errors
+            
+            # Plot using the clean DataFrame
+            try:
+                st.bar_chart(value_counts.set_index('Category'))
+            except Exception:
+                # Fallback to plotly if Altair fails (e.g. extremely weird characters)
+                fig = px.bar(value_counts, x='Category', y='Count')
+                st.plotly_chart(fig)
 
             # display the value count in tabular format
             st.write(f"Value Count for {column}")
-            value_counts_table = df[column].value_counts().reset_index()
-            value_counts_table.columns = ['Value', 'Count']
-            st.write(value_counts_table)
+            st.write(value_counts)
     else:
         st.info("The dataset does not have any categorical columns")
 
